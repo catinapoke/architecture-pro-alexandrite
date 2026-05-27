@@ -1,0 +1,69 @@
+@startuml
+title Кеширование заказов в MES
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam sequenceParticipant underline
+
+participant "MES\n(Frontend)" as MES
+participant "MES API" as API
+participant "Cache\n(Redis)" as Cache
+database "Database\n(PostgreSQL)" as DB
+participant "Message Broker\n(RabbitMQ)" as MB
+
+== Получение списка заказов ==
+
+MES -> API: GET /orders?status=MANUFACTURING_STARTED\n&page=1&count=20
+
+API -> Cache: ZREVRANGE orders:status:MANUFACTURING_STARTED\npage count
+Cache --> API: [order_id_1, order_id_2, ..., order_id_N]
+
+loop для каждого order_id
+    API -> Cache: HGET order:{id}
+    alt Cache Hit
+        Cache --> API: данные заказа
+    else Cache Miss
+        Cache --> API: nil
+        API -> DB: SELECT * FROM orders WHERE id = {id}
+        DB --> API: данные заказа
+        API -> Cache: HSET order:{id} {...данные заказа}
+    end
+end
+
+API --> MES: список заказов (page 1, count items)
+
+== Запись/обновление заказа из брокера сообщений ==
+
+MB -> API: сообщение о новом заказе\nили смене статуса
+
+API -> DB: INSERT / UPDATE order
+DB --> API: OK
+
+API -> Cache: PIPELINE
+note right of Cache
+  ZADD orders:status:{новый_статус} {timestamp} {order_id}
+  ZREM orders:status:{старый_статус} {order_id}
+  HSET order:{id} {...обновлённые данные}
+end note
+Cache --> API: OK
+
+API --> MB: ACK (сообщение обработано)
+
+== Оператор меняет статус заказа ==
+
+MES -> API: PATCH /orders/{id}/status\n{status: "MANUFACTURING_STARTED"}
+
+API -> DB: UPDATE orders SET status = {новый_статус}\nWHERE id = {id}
+DB --> API: OK
+
+API -> Cache: PIPELINE
+note right of Cache
+  ZADD orders:status:{новый_статус} {timestamp} {order_id}
+  ZREM orders:status:{старый_статус} {order_id}
+  HSET order:{id} {...обновлённые данные}
+end note
+Cache --> API: OK
+
+API --> MES: 200 OK
+
+@enduml
